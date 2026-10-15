@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cipherx"
+version = "1.0.0"
+description = "Hybrid AES-256-GCM + custom structural cipher with Base-26 alphabet-only encoding"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Akanksh J K" },
+    { name = "Sujal Sunil Badde" },
+]
+keywords = ["cryptography", "aes-gcm", "scrypt", "cipher", "base26", "iot", "obfuscation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = ["cryptography>=41.0.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Repository = "https://github.com/akankshjk5/Hybrid-AES-Custom-Cipher-Encryption-Model"
+
+[project.scripts]
+cipherx = "cipherx.cli:main"
+
+[tool.setuptools]
+packages = ["cipherx"]
