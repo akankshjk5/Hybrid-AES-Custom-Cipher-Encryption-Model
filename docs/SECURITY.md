@@ -30,32 +30,59 @@ agrees: it offers no formal proof for that layer. Treat it as obfuscation.
 
 ## Findings
 
-### Finding 1 — The noise layer repeats across messages (design limitation)
+### Finding 1 — Structural layer repeated across messages — **FIXED**
 
-**Severity: moderate.** The noise pool ordering and the interval `gap` come
-from `CSPRNG(Kc, "NOISE")`, which depends on the structural key alone — not on
-any per-message value. Every message under one key therefore carries nearly
-the same noise subsequence.
+**Was: moderate. Now resolved.**
 
-Measured over two encryptions of the same plaintext:
+The noise pool ordering and the interval `gap` came from `CSPRNG(Kc, "NOISE")`,
+which depends on the structural key alone — not on any per-message value. Every
+message under one key therefore carried nearly the same noise subsequence. The
+same applied to the segmentation and block-permutation streams: each key
+induced one fixed transformation per message length.
+
+Measured over two encryptions of the same plaintext, before the fix:
 
 | Position class | Agreement |
 |---|---|
 | Payload (`A-Z`) positions | 4.9 % (chance is 3.8 %) |
-| Noise positions | ~90 % |
+| Noise positions | **~90 %** |
 
-The payload is well randomised; the noise is not. An adversary with two
-ciphertexts under the same key can locate noise positions, read off `gap`, and
-strip the stage without knowing any key — undoing one of the five obfuscation
-layers for free. This partly contradicts the claim in Section 3.B that
+The payload was well randomised; the noise was not. An adversary with two
+ciphertexts under the same key could locate noise positions, read off `gap`,
+and strip the stage without knowing any key — undoing one of the five
+obfuscation layers for free, and contradicting the Section 3.B claim that
 repetition patterns are concealed.
 
-*Remedy:* derive the noise schedule from a per-message nonce transmitted in the
-clear alongside the ciphertext, e.g. `CSPRNG(Kc, "NOISE" || nonce)`. This
-changes the ciphertext format, which the paper does not specify, so it is
-documented rather than silently applied.
+**Fix.** A 16-character per-message structural nonce (~75 bits, uniform `A-Z`)
+is drawn for every encryption, prefixed to the ciphertext in the clear like an
+IV, and folded into the HKDF `info` of *all four* CSPRNG streams:
 
-*Pinned by* `tests/test_paper_claims.py::TestReversibility::test_noise_layer_repeats_across_messages`
+```
+info = label || "/" || nonce      for label in {SEGMENT, WORDS, NOISE, BLOCKS}
+```
+
+All four, not just `NOISE`, because the others carried the same defect in a
+less visible form: a fixed segmentation and block permutation per
+`(key, length)` means one known plaintext/ciphertext pair would expose the
+permutation for every other message of that length. The nonce costs 16
+characters and removes the whole class.
+
+The nonce is covered by the outer HMAC, so it cannot be swapped; decryption
+validates it only *after* the tag verifies, so a malformed nonce never reaches
+the stages.
+
+| Position class | Agreement after the fix |
+|---|---|
+| Payload positions | 3.1 % |
+| Noise positions | **0.7 %** |
+
+*Side effect, beneficial:* `gap` is now drawn per message, so noise volume —
+and therefore ciphertext length — varies by roughly 10–16 % between messages.
+Length is no longer a deterministic function of plaintext size, which blurs
+(though does not remove) the mapping described in Finding 6.
+
+*Pinned by* `tests/test_paper_claims.py::TestReversibility::test_noise_layer_is_per_message_randomised`
+and `tests/test_hybrid.py::TestStructuralNonce`
 
 ### Finding 2 — The `PAPER` profile truncates the outer tag to 64 bits
 
@@ -121,10 +148,15 @@ plaintext and check it after decryption.
 
 ### Finding 6 — Length is not hidden
 
-Ciphertext length is a near-affine function of plaintext length (expansion ~2×
-for inputs past 1 kB). Message size, and therefore a good deal of traffic
-structure, remains visible. The paper's metadata-leakage motivation is only
-partly addressed: content patterns are obscured, size is not. Pad before
+Ciphertext length tracks plaintext length closely (expansion ~2× for inputs
+past 1 kB). Message size, and therefore a good deal of traffic structure,
+remains visible. The paper's metadata-leakage motivation is only partly
+addressed: content patterns are obscured, size is not.
+
+The Finding 1 fix softens this without solving it. Because `gap` is now drawn
+per message, ciphertext length varies by roughly 10–16 % for a fixed plaintext
+size, so the mapping is no longer exact. An adversary still learns size to
+within that band, and averaging over repeated messages recovers it. Pad before
 encrypting if size matters.
 
 ---
@@ -141,9 +173,10 @@ Verified by the test suite:
   rejected, as is every truncation and append tested.
 - **Constant-time tag comparison.** `hmac.compare_digest`, so the outer check
   is not a byte-at-a-time forgery oracle.
-- **Semantic security against repetition.** A fresh salt and nonce per call
-  mean identical plaintexts produce unrelated payload bytes (Finding 1 covers
-  the noise positions).
+- **Semantic security against repetition.** A fresh salt, GCM nonce and
+  structural nonce per call mean identical plaintexts produce unrelated
+  ciphertexts at every position class — 3.1 % agreement on payload positions
+  and 0.7 % on noise positions, both at chance.
 - **Unbiased CSPRNG draws.** `randint` uses rejection sampling, so rotations,
   intervals and permutations carry no modulo bias.
 - **Fail-closed decryption.** The outer tag is verified *before* any structural
@@ -153,10 +186,11 @@ Verified by the test suite:
 
 ## Operational guidance
 
-- **Never reuse a `(passphrase, salt)` pair, and never pin `salt=` or `nonce=`
-  outside tests.** The parameters exist for reproducible test vectors. GCM
-  fails catastrophically on nonce reuse: two messages under one key and nonce
-  leak their XOR and expose the GHASH authentication key.
+- **Never pin `salt=`, `nonce=` or `structural_nonce=` outside tests.** They
+  exist for reproducible test vectors and for the benchmark script. GCM fails
+  catastrophically on nonce reuse: two messages under one key and nonce leak
+  their XOR and expose the GHASH authentication key. Reusing
+  `structural_nonce` reinstates Finding 1.
 - **Keep the two keys independent.** The AES passphrase and the structural key
   protect different layers; deriving one from the other collapses them.
 - **Scrypt costs ~64 MB per derivation.** That is the point, but it rules out

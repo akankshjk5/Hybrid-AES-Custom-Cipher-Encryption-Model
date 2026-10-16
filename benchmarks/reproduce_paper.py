@@ -36,6 +36,18 @@ from cipherx.params import PAPER  # noqa: E402
 PASSPHRASE = "aes-strong-passphrase"
 STRUCTURAL_KEY = "akanksh-super-unique-key"
 
+#: Pinned so the tables are reproducible run to run.
+#:
+#: Since the per-message structural nonce was introduced, the noise interval
+#: ``gap`` is drawn per message from ``[3, 7]``. Noise volume therefore varies,
+#: and with it ciphertext length (~10-16% spread) and entropy (~5.07-5.26).
+#: This particular nonce yields ``gap = 5``, matching the interval the paper's
+#: own structural key produced, so the comparison against Table II stays
+#: apples-to-apples. Real encryption always draws a fresh nonce; pinning one
+#: here isolates the size-dependent behaviour the tables are about.
+#: ``--random-nonce`` shows the real-world spread instead.
+REPRODUCIBLE_NONCE = "PAPERREPRODUCTIO"
+
 #: The six rows of the paper's Table II.
 PAPER_SIZES = [12, 71, 37, 44, 1000, 10000]
 
@@ -73,18 +85,39 @@ def _time(fn, repeats: int) -> float:
     return statistics.median(samples)
 
 
-def measure(size: int, repeats: int) -> Row:
+def measure(size: int, repeats: int, nonce: str = REPRODUCIBLE_NONCE) -> Row:
     cipher = CipherX(PAPER)
     message = "A" * size
-    ciphertext = cipher.encrypt(message, PASSPHRASE, STRUCTURAL_KEY)
+    kwargs = {"structural_nonce": nonce} if nonce else {}
+    ciphertext = cipher.encrypt(message, PASSPHRASE, STRUCTURAL_KEY, **kwargs)
     return Row(
         size=size,
-        enc_ms=_time(lambda: cipher.encrypt(message, PASSPHRASE, STRUCTURAL_KEY), repeats),
+        enc_ms=_time(
+            lambda: cipher.encrypt(message, PASSPHRASE, STRUCTURAL_KEY, **kwargs), repeats
+        ),
         dec_ms=_time(lambda: cipher.decrypt(ciphertext, PASSPHRASE, STRUCTURAL_KEY), repeats),
         cipher_len=len(ciphertext),
         expansion=expansion_ratio(message, ciphertext),
         entropy=entropy_report(ciphertext).entropy,
     )
+
+
+def print_nonce_spread(size: int = 1000, trials: int = 12) -> None:
+    """Show how much the fresh-nonce path varies, which the pinned table hides."""
+    cipher = CipherX(PAPER)
+    message = "A" * size
+    rows = [cipher.encrypt(message, PASSPHRASE, STRUCTURAL_KEY) for _ in range(trials)]
+    lengths = [len(c) for c in rows]
+    entropies = [entropy_report(c).entropy for c in rows]
+
+    print(f"\nPer-message nonce spread ({size:,} characters, {trials} fresh nonces)\n")
+    print(f"  ciphertext length  {min(lengths):,}-{max(lengths):,} "
+          f"({100*(max(lengths)-min(lengths))/min(lengths):.1f}% spread)")
+    print(f"  entropy            {min(entropies):.2f}-{max(entropies):.2f} bits/char")
+    print("\n  The noise interval gap is drawn per message from [3, 7], so noise")
+    print("  volume -- and therefore length and entropy -- varies. Length is no")
+    print("  longer a deterministic function of plaintext size, which blurs the")
+    print("  exact size mapping an observer could otherwise rely on.")
 
 
 def print_table_ii(rows: List[Row], markdown: bool) -> None:
@@ -158,21 +191,29 @@ def main() -> int:
     parser.add_argument("--markdown", action="store_true", help="emit Markdown tables")
     parser.add_argument("--breakdown", action="store_true", default=True,
                         help="show the Scrypt / structural split")
+    parser.add_argument("--random-nonce", action="store_true",
+                        help="draw a fresh structural nonce per message "
+                             "(realistic, but the tables stop being reproducible)")
     args = parser.parse_args()
+
+    nonce = "" if args.random_nonce else REPRODUCIBLE_NONCE
 
     print("CipherX -- reproducing the published tables")
     print(f"profile=paper  repeats={args.repeats}  python={sys.version.split()[0]}")
+    print(f"structural nonce: {'fresh per message' if args.random_nonce else nonce + ' (pinned)'}")
 
     rows = []
     for size in args.sizes:
         print(f"  measuring {size:,} characters ...", end="", flush=True)
-        rows.append(measure(size, args.repeats))
+        rows.append(measure(size, args.repeats, nonce))
         print(" done")
 
     print_table_ii(rows, args.markdown)
     print_table_i(rows, args.markdown)
     if args.breakdown:
         print_breakdown(args.repeats)
+    if not args.random_nonce:
+        print_nonce_spread()
 
     enc = [r.enc_ms for r in rows]
     print(f"\nFlatness check: encryption spans {min(enc):.0f}-{max(enc):.0f} ms "

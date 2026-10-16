@@ -85,9 +85,12 @@ class TestExpansion:
         assert 1.5 <= ratio <= 2.5
 
     def test_expansion_decreases_with_size(self):
+        """Nonce pinned: per-message ``gap`` variation is larger than the gap
+        between the 1 kB and 10 kB ratios, which are already nearly equal."""
         cipher = CipherX(FAST_TEST)
         ratios = [
-            expansion_ratio("A" * n, cipher.encrypt("A" * n, PASSPHRASE, STRUCTURAL_KEY))
+            expansion_ratio("A" * n, cipher.encrypt(
+                "A" * n, PASSPHRASE, STRUCTURAL_KEY, structural_nonce="A" * 16))
             for n in (12, 100, 1000, 10000)
         ]
         assert ratios == sorted(ratios, reverse=True)
@@ -95,16 +98,37 @@ class TestExpansion:
 
 class TestScaling:
     def test_ciphertext_length_is_linear_in_input(self):
-        """Paper Section 6.1 claims linear-time, linear-size behaviour."""
+        """Paper Section 6.1 claims linear-time, linear-size behaviour.
+
+        The structural nonce is pinned so the noise interval is held constant
+        across the three sizes; otherwise per-message ``gap`` variation
+        (3..7) swamps the effect being measured.
+        """
         cipher = CipherX(FAST_TEST)
+        pinned = dict(structural_nonce="A" * 16)
         lengths = {
-            n: len(cipher.encrypt("A" * n, PASSPHRASE, STRUCTURAL_KEY))
+            n: len(cipher.encrypt("A" * n, PASSPHRASE, STRUCTURAL_KEY, **pinned))
             for n in (1000, 2000, 4000)
         }
         # Doubling input should roughly double output, once fixed overhead is small.
         r1 = lengths[2000] / lengths[1000]
         r2 = lengths[4000] / lengths[2000]
         assert 1.8 < r1 < 2.2 and 1.9 < r2 < 2.1
+
+    def test_length_now_varies_between_messages(self):
+        """Side benefit of the per-message nonce, relevant to Finding 6.
+
+        ``gap`` is drawn per message from ``[3, 7]``, so the noise volume --
+        and therefore the ciphertext length -- is no longer a deterministic
+        function of plaintext size. Measured spread is roughly 10-16%. That
+        does not hide length, but it does blur the exact mapping an observer
+        could otherwise rely on.
+        """
+        cipher = CipherX(FAST_TEST)
+        lengths = {len(cipher.encrypt("A" * 1000, PASSPHRASE, STRUCTURAL_KEY))
+                   for _ in range(12)}
+        assert len(lengths) > 1, "ciphertext length should vary between messages"
+        assert (max(lengths) - min(lengths)) / min(lengths) > 0.02
 
 
 class TestReversibility:
@@ -134,24 +158,20 @@ class TestReversibility:
         rate = matching / len(letter_positions)
         assert rate < 0.08, f"payload positions agree at {rate:.1%}, above chance"
 
-    def test_noise_layer_repeats_across_messages(self):
-        """Known weakness, pinned deliberately: the noise stage is not
-        per-message randomised.
+    def test_noise_layer_is_per_message_randomised(self):
+        """SECURITY.md Finding 1, fixed: the noise stage no longer repeats.
 
-        ``gap`` and the shuffled noise pool are drawn from
-        ``CSPRNG(Kc, "NOISE")``, which depends on the structural key alone. Two
-        messages under one key therefore carry nearly the same noise
-        subsequence -- measured at roughly 90% agreement on noise positions.
+        ``gap`` and the shuffled noise pool used to be drawn from
+        ``CSPRNG(Kc, "NOISE")``, which depends on the structural key alone.
+        Two messages under one key then carried nearly the same noise
+        subsequence -- roughly **90%** agreement on noise positions. An
+        observer with two ciphertexts could locate the noise, read off
+        ``gap``, and strip the stage without knowing any key, undoing one of
+        the paper's five obfuscation layers and contradicting the Section 3.B
+        claim that repetition is concealed.
 
-        An observer who collects two ciphertexts can locate noise positions,
-        read off ``gap``, and strip the stage without knowing any key, undoing
-        one of the paper's five obfuscation layers. That contradicts the
-        Section 3.B claim that repetition is concealed.
-
-        This test records the behaviour rather than hiding it; see
-        ``docs/SECURITY.md`` (Finding 1) for the recommended fix, which needs a
-        per-message structural nonce and therefore a ciphertext-format change
-        the paper does not specify.
+        A per-message structural nonce now feeds every generator, so noise
+        positions agree at chance. Measured at ~0.7%.
         """
         from cipherx.params import NOISE_ALPHABET
 
@@ -163,10 +183,18 @@ class TestReversibility:
 
         noise = set(NOISE_ALPHABET)
         noise_positions = [i for i in range(shared) if a[i] in noise or b[i] in noise]
-        agreeing = sum(1 for i in noise_positions if a[i] == b[i])
-        rate = agreeing / len(noise_positions)
-        assert rate > 0.5, (
-            "expected the deterministic noise layer to repeat across messages; "
-            f"measured {rate:.1%}. If this now fails, the noise stage was made "
-            "per-message randomised -- update docs/SECURITY.md Finding 1."
+        rate = sum(1 for i in noise_positions if a[i] == b[i]) / len(noise_positions)
+        assert rate < 0.15, (
+            f"noise positions agree at {rate:.1%}; the stage looks key-derived "
+            "again rather than per-message. See docs/SECURITY.md Finding 1."
         )
+
+    def test_whole_ciphertext_agrees_only_at_chance(self):
+        """With the nonce in place, no position class leaks across messages."""
+        cipher = CipherX(FAST_TEST)
+        message = "status=OK;" * 50
+        a = cipher.encrypt(message, PASSPHRASE, STRUCTURAL_KEY)
+        b = cipher.encrypt(message, PASSPHRASE, STRUCTURAL_KEY)
+        shared = min(len(a), len(b))
+        rate = sum(1 for i in range(shared) if a[i] == b[i]) / shared
+        assert rate < 0.10, f"ciphertexts agree at {rate:.1%}, above chance"

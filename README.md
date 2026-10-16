@@ -32,7 +32,7 @@ AES-256-GCM  ──► salt ‖ nonce ‖ ciphertext ‖ tag
    ▼
 Base-26      ──► 4-letter length header + A–Z body
    ▼
-Structural layer
+Structural layer  ◄── fresh 16-char nonce per message
    ├─ nonlinear alphabet remapping
    ├─ enhanced Vigenère shifting
    ├─ keyed segment reversal / rotation
@@ -41,16 +41,18 @@ Structural layer
    ▼
 HMAC-SHA256 outer tag
    ▼
-ciphertext
+nonce ‖ body ‖ tag
 ```
 
 Every structural stage is a bijection driven by an HKDF/HMAC-SHA256 CSPRNG
-seeded only by the key, so decryption redraws the identical choices and runs
-the inverses in reverse.
+seeded by the key *and a per-message nonce*, so decryption redraws the
+identical choices and runs the inverses in reverse. The nonce travels in the
+clear like an IV and is authenticated by the outer tag.
 
 > **Read [`docs/SECURITY.md`](docs/SECURITY.md) before using this for
 > anything.** The security of CipherX is the security of AES-256-GCM; the
-> structural layer is obfuscation, and it has six documented limitations.
+> structural layer is obfuscation. Six findings are documented there — one
+> now fixed, five standing.
 
 ## Install
 
@@ -122,21 +124,25 @@ Measured on Python 3.12 against the published Table II:
 
 | Input | Paper enc/dec/len | This implementation | Entropy |
 |---:|---|---|---:|
-| 12 | 556 / 525 / 136 | 591 / 518 / **142** | 5.25 |
-| 71 | 496 / 497 / 256 | 442 / 402 / **262** | 5.29 |
-| 37 | 428 / 466 / 190 | 407 / 468 / **196** | 5.21 |
-| 44 | 447 / 480 / 202 | 453 / 446 / **208** | 5.28 |
-| 1,000 | 470 / 462 / 2,158 | 449 / 449 / **2,164** | 5.25 |
-| 10,000 | 584 / 499 / 20,536 | 481 / 467 / **20,542** | 5.24 |
+| 12 | 556 / 525 / 136 | 568 / 423 / **158** | 5.19 |
+| 71 | 496 / 497 / 256 | 410 / 422 / **278** | 5.24 |
+| 37 | 428 / 466 / 190 | 453 / 465 / **212** | 5.22 |
+| 44 | 447 / 480 / 202 | 448 / 437 / **224** | 5.24 |
+| 1,000 | 470 / 462 / 2,158 | 410 / 414 / **2,180** | 5.24 |
+| 10,000 | 584 / 499 / 20,536 | 438 / 444 / **20,558** | 5.24 |
 
-Every ciphertext length is exactly **+6** characters — the lossless length
-header that replaces the reference implementation's lossy padding (see D3
-below). Entropy averages 5.25 bits/char against the paper's 5.28, inside the
-published 5.23–5.33 band.
+Every ciphertext length is exactly **+22** characters: the 6-character
+lossless length header that replaces the reference implementation's lossy
+padding (D3), plus the 16-character per-message nonce (D6). Entropy averages
+5.23 bits/char against the paper's 5.28, inside the published 5.23–5.33 band.
 
-The paper's linear-time claim holds for the reason it gives: encryption spans
-just 406–591 ms across an 833× range of input sizes, because Scrypt accounts
-for **87 %** of the clock.
+The paper's linear-time claim holds for the reason it gives: Scrypt accounts
+for **92 %** of the clock, so encryption stays in a narrow band across an 833×
+range of input sizes.
+
+The benchmark pins the structural nonce so figures are stable. With fresh
+nonces, a fixed 1,000-character plaintext produces ciphertexts of 2,078–2,414
+characters, since the noise interval is drawn per message.
 
 ## What changed from the original implementation
 
@@ -182,19 +188,30 @@ loop: O(d²), about 22,000 divisions on an 80,000-bit integer for the 10 kB
 case. Replaced with recursive splitting that produces the **identical** digit
 string — asserted against a transcription of the paper's own method.
 
+**D6 — Per-message nonce.** Every CSPRNG stream was seeded from the structural
+key alone, so each key induced one fixed transformation per message length.
+About **90 %** of noise positions repeated across two messages under the same
+key, letting an observer locate the noise, read off the interval, and strip
+that stage with no key at all. A 16-character nonce (~75 bits) is now drawn
+per message, prefixed to the ciphertext like an IV, authenticated by the outer
+tag, and folded into all four streams — not just the noise one, since a fixed
+segmentation and block permutation per `(key, length)` leaks the same way
+under known plaintext. Noise agreement drops to **0.7 %**. This is the one
+change that alters the wire format.
+
 ## Tests
 
 ```bash
 pip install pytest
-pytest                  # 146 tests
+pytest                  # 166 tests
 pytest -m "not slow"    # skip the full-Scrypt cases
 ```
 
-Covers per-stage invertibility, the three regressions above, fuzzed
-round-trips across six structural keys, tamper detection on every character
-position, malformed-input handling, CSPRNG determinism and bias, and the
-paper's own quantitative claims — including two it gets wrong
-(`docs/SECURITY.md`, Findings 1 and 4).
+Covers per-stage invertibility, the four regressions above, fuzzed round-trips
+across six structural keys and fresh nonces, tamper detection on every
+character position including the nonce, malformed-input handling, CSPRNG
+determinism and bias, and the paper's own quantitative claims — including two
+it gets wrong (`docs/SECURITY.md`, Findings 1 and 4).
 
 ## Layout
 

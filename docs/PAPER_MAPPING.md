@@ -27,8 +27,8 @@ Sources:
 | 10–18 | odd → reverse, even → keyed rotate | [`structural.transform_segments`](../cipherx/structural.py) |
 | 20–21 | `S4 ← INSERT_NOISE(S3, rngN)` | [`structural.insert_noise`](../cipherx/structural.py) |
 | 22–23 | `S5 ← BLOCK_SHUFFLE(S4, blk=6, rngB)` | [`structural.block_shuffle`](../cipherx/structural.py) — **changed, see D3** |
-| 24 | `TH ← HMAC_SHA256(Kc, S5)` | [`hybrid.CipherX._tag`](../cipherx/hybrid.py) — **changed, see D4** |
-| 25 | `CT ← S5 ‖ HEX(TH)` | [`hybrid.CipherX.encrypt`](../cipherx/hybrid.py) |
+| 24 | `TH ← HMAC_SHA256(Kc, S5)` | [`hybrid.CipherX._tag`](../cipherx/hybrid.py) — **changed, see D4 and D6** |
+| 25 | `CT ← S5 ‖ HEX(TH)` | [`hybrid.CipherX.encrypt`](../cipherx/hybrid.py) — **changed, see D6** |
 
 ## Narrative sections
 
@@ -52,8 +52,9 @@ Sources:
 
 ## Deliberate differences
 
-Five changes. Three are bug fixes, one resolves a contradiction in the paper,
-one is a pure optimisation.
+Six changes. Three are bug fixes, one resolves a contradiction in the paper,
+one is a pure optimisation, and one closes a weakness the paper does not
+mention.
 
 ### D1 — Stage order corrected to match Algorithm 1
 
@@ -104,9 +105,9 @@ the end; the nonlinear map sends `'A'` at position 1 to `'L'`; and turning
 never `'X'` and the bug never fires — until someone changes the key.
 
 Replaced with an explicit 6-character Base-26 length header prepended before
-padding (exactly one block at the paper's `blk = 6`). This is the only change
-that alters ciphertext length: **+6 characters**, which is precisely the offset
-visible between this implementation and Table II.
+padding (exactly one block at the paper's `blk = 6`). This accounts for
+**+6 characters** of the +22 offset against Table II; the remaining +16 is the
+nonce from D6.
 
 *Pinned by* `tests/test_structural.py::TestBlockPermutation::test_payload_ending_in_x_survives`
 
@@ -135,6 +136,48 @@ splitting at `26^(d/2)`. `tests/test_base26.py::TestEquivalence` asserts
 equality against a literal transcription of the paper's method, so fidelity is
 exact and the change is invisible in the output.
 
+### D6 — Per-message structural nonce (ciphertext-format change)
+
+**This one deviates from the paper's wire format, and does so deliberately.**
+
+Every CSPRNG stream was seeded from the structural key alone, so each key
+induced exactly one transformation per message length. The visible consequence:
+roughly **90 %** of noise positions repeated across two messages under the same
+key, letting an observer locate the noise, read off `gap`, and strip that stage
+with no key at all — defeating one of the five obfuscation layers and
+contradicting the Section 3.B claim that repetition is concealed.
+
+A 16-character nonce (~75 bits, uniform `A-Z`) is now drawn per message and
+folded into the HKDF `info` of all four streams:
+
+```
+info = label || "/" || nonce      label ∈ {SEGMENT, WORDS, NOISE, BLOCKS}
+```
+
+All four rather than only `NOISE`, because the others carried the same defect
+less visibly — a fixed segmentation and block permutation per `(key, length)`
+means one known plaintext/ciphertext pair exposes the permutation for every
+message of that length.
+
+The wire format becomes:
+
+```
+CT = nonce (16 chars, A-Z) ‖ S5 ‖ HEX(TH)
+```
+
+with the nonce inside the MAC input (`VERSION_TAG ‖ nonce ‖ S5`) so it cannot
+be swapped, and validated only after the tag verifies so a malformed nonce
+never reaches the inverse stages.
+
+Measured after the fix: noise-position agreement **0.7 %**, payload-position
+agreement **3.1 %** — both at chance.
+
+A side effect worth noting: `gap` is now per-message, so ciphertext length
+varies ~10–16 % for a fixed plaintext size. That is mildly beneficial
+(Finding 6) but means the benchmark pins a nonce to stay reproducible.
+
+*Pinned by* `tests/test_hybrid.py::TestStructuralNonce`
+
 ---
 
 ## Reproduction
@@ -143,19 +186,31 @@ exact and the change is invisible in the output.
 python benchmarks/reproduce_paper.py
 ```
 
+The benchmark pins the structural nonce (`PAPERREPRODUCTIO`, chosen because it
+yields `gap = 5` — the same noise interval the paper's own structural key
+produced), so the comparison stays apples-to-apples and the figures are stable
+run to run. `--random-nonce` shows the realistic spread instead.
+
 Measured on Python 3.12, against the published tables:
 
-| Input | Paper enc / dec / len | This implementation |
-|---:|---|---|
-| 12 | 556 / 525 / 136 | 591 / 518 / 142 |
-| 71 | 496 / 497 / 256 | 442 / 402 / 262 |
-| 37 | 428 / 466 / 190 | 407 / 468 / 196 |
-| 44 | 447 / 480 / 202 | 453 / 446 / 208 |
-| 1,000 | 470 / 462 / 2,158 | 449 / 449 / 2,164 |
-| 10,000 | 584 / 499 / 20,536 | 481 / 467 / 20,542 |
+| Input | Paper enc / dec / len | This implementation | Offset |
+|---:|---|---|---:|
+| 12 | 556 / 525 / 136 | 568 / 423 / 158 | +22 |
+| 71 | 496 / 497 / 256 | 410 / 422 / 278 | +22 |
+| 37 | 428 / 466 / 190 | 453 / 465 / 212 | +22 |
+| 44 | 447 / 480 / 202 | 448 / 437 / 224 | +22 |
+| 1,000 | 470 / 462 / 2,158 | 410 / 414 / 2,180 | +22 |
+| 10,000 | 584 / 499 / 20,536 | 438 / 444 / 20,558 | +22 |
 
-Every ciphertext length is exactly **+6** — the length header from D3.
-Entropy averages 5.25 bits/char against the paper's 5.28, inside the published
-5.23–5.33 band. Timings differ by hardware, but the shape holds: a 1.45×
-spread in encryption time across an 833× range of input sizes, because Scrypt
-accounts for 87 % of the clock.
+Every ciphertext length is exactly **+22**: the 6-character length header from
+D3 plus the 16-character nonce from D6. Nothing else about the size behaviour
+changed.
+
+Entropy averages 5.23 bits/char (range 5.19–5.24) against the paper's 5.28
+(5.23–5.33). Timings differ by hardware, but the shape holds: Scrypt accounts
+for about 92 % of runtime, so encryption stays within a narrow band across an
+833× range of input sizes.
+
+With fresh nonces, a fixed 1,000-character plaintext yields ciphertexts of
+2,078–2,414 characters (16.2 % spread) and entropy of 5.16–5.34 bits/char,
+since `gap` varies per message.

@@ -4,8 +4,16 @@ Encryption::
 
     message --[AES-256-GCM over a Scrypt key]--> packed bytes
             --[Base-26]--> A-Z string
-            --[structural layer]--> obfuscated string
+            --[structural layer, under a fresh nonce]--> obfuscated string
             --[outer HMAC-SHA256]--> ciphertext
+
+The wire format is::
+
+    nonce (16 chars, A-Z) || body || tag (hex, 16 or 64 chars)
+
+The structural nonce is public, like an IV: it has to be readable before any
+stage can be inverted. It is authenticated by the outer tag, so it cannot be
+swapped without detection.
 
 Decryption verifies the outer tag *before* touching any of the structural
 stages, so a tampered ciphertext is rejected without running the inverse
@@ -32,7 +40,14 @@ from .aead import seal, unseal
 from .exceptions import DecodingError, IntegrityError
 from .kdf import derive_structural_subkey
 from .params import PAPER, Profile
-from .structural import apply_structural, invert_structural
+from .structural import (
+    NONCE_LEN,
+    StructuralContext,
+    apply_structural,
+    generate_nonce,
+    invert_structural,
+    validate_nonce,
+)
 
 __all__ = ["VERSION_TAG", "CipherX", "encrypt", "decrypt"]
 
@@ -63,10 +78,17 @@ class CipherX:
 
     # ------------------------------------------------------------------
 
-    def _tag(self, body: str, structural_key: str) -> str:
-        """Outer HMAC-SHA256 over ``VERSION_TAG || body``, hex, truncated."""
+    def _tag(self, nonce: str, body: str, structural_key: str) -> str:
+        """Outer HMAC-SHA256 over ``VERSION_TAG || nonce || body``, hex, truncated.
+
+        The nonce is inside the MAC input, so an attacker cannot swap it for
+        another value and have the ciphertext still verify. ``nonce`` is
+        fixed-width, so there is no ambiguity about where it ends.
+        """
         key = derive_structural_subkey(structural_key)
-        mac = hmac.new(key, VERSION_TAG + body.encode("utf-8"), hashlib.sha256)
+        mac = hmac.new(
+            key, VERSION_TAG + (nonce + body).encode("utf-8"), hashlib.sha256
+        )
         return mac.hexdigest()[:self.profile.tag_hex_len]
 
     # ------------------------------------------------------------------
@@ -79,6 +101,7 @@ class CipherX:
         *,
         salt: Optional[bytes] = None,
         nonce: Optional[bytes] = None,
+        structural_nonce: Optional[str] = None,
     ) -> str:
         """Encrypt ``message`` and return the hybrid ciphertext.
 
@@ -89,10 +112,19 @@ class CipherX:
             passphrase: AES passphrase, stretched with Scrypt.
             structural_key: key for the structural layer and the outer tag.
             salt, nonce: test-vector overrides; see :func:`cipherx.aead.seal`.
+            structural_nonce: override the per-message structural nonce.
+                **Tests and published test vectors only.** Reusing it across
+                messages under one key reinstates the repeating-noise weakness
+                it exists to remove (``docs/SECURITY.md`` Finding 1).
 
         Raises:
             PayloadTooLargeError: past the Base-26 header's 456,975-byte ceiling.
+            ParameterError: if ``structural_nonce`` is not 16 ``A-Z`` characters.
         """
+        snonce = (
+            generate_nonce() if structural_nonce is None
+            else validate_nonce(structural_nonce)
+        )
         packed = seal(
             message.encode("utf-8"),
             passphrase,
@@ -101,8 +133,9 @@ class CipherX:
             nonce=nonce,
         )
         encoded = base26.encode(packed)
-        body = apply_structural(encoded, structural_key, self.profile.structural)
-        return body + self._tag(body, structural_key)
+        ctx = StructuralContext(structural_key, snonce, self.profile.structural)
+        body = apply_structural(encoded, ctx)
+        return snonce + body + self._tag(snonce, body, structural_key)
 
     def decrypt(self, ciphertext: str, passphrase: str, structural_key: str) -> str:
         """Invert :meth:`encrypt`.
@@ -113,24 +146,31 @@ class CipherX:
             IntegrityError: the outer HMAC or the inner GCM tag did not verify.
         """
         tag_len = self.profile.tag_hex_len
-        if len(ciphertext) <= tag_len:
+        if len(ciphertext) <= NONCE_LEN + tag_len:
             raise DecodingError(
                 f"ciphertext is {len(ciphertext)} characters, too short to hold a "
-                f"{tag_len}-character tag and a body"
+                f"{NONCE_LEN}-character nonce, a {tag_len}-character tag and a body"
             )
 
-        body, tag = ciphertext[:-tag_len], ciphertext[-tag_len:]
+        snonce = ciphertext[:NONCE_LEN]
+        body = ciphertext[NONCE_LEN:-tag_len]
+        tag = ciphertext[-tag_len:]
+
         if not _HEX_DIGITS.issuperset(tag.lower()):
             raise DecodingError("ciphertext tag is not hexadecimal")
 
         # Constant-time: a timing-variable compare here would leak the tag one
         # character at a time and turn this into a forgery oracle.
-        if not hmac.compare_digest(tag, self._tag(body, structural_key)):
+        if not hmac.compare_digest(tag, self._tag(snonce, body, structural_key)):
             raise IntegrityError(
                 "outer HMAC verification failed: wrong structural key or modified ciphertext"
             )
 
-        encoded = invert_structural(body, structural_key, self.profile.structural)
+        # Only now is the nonce trusted: the tag covers it, so a malformed one
+        # has already been rejected above rather than reaching the stages.
+        validate_nonce(snonce)
+        ctx = StructuralContext(structural_key, snonce, self.profile.structural)
+        encoded = invert_structural(body, ctx)
         packed = base26.decode(encoded)
         return unseal(packed, passphrase, self.profile.scrypt).decode("utf-8")
 

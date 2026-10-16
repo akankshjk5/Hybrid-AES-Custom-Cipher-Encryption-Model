@@ -17,9 +17,14 @@ import pytest
 
 from cipherx import CipherX
 from cipherx.params import FAST_TEST, StructuralParams
+from cipherx.structural import StructuralContext
 
 PASSPHRASE = "test-passphrase"
 STRUCTURAL_KEY = "test-structural-key"
+
+#: A pinned structural nonce. Real encryption draws a fresh one per message;
+#: tests pin it so a failure reproduces exactly.
+NONCE = "QWERTYUIOPASDFGH"
 
 #: Keys chosen to span the behaviour that broke the reference implementation.
 #: ``akanksh-super-unique-key`` is its shipped default, under which the
@@ -42,6 +47,17 @@ def cipher() -> CipherX:
 @pytest.fixture
 def params() -> StructuralParams:
     return StructuralParams()
+
+
+@pytest.fixture
+def ctx(params: StructuralParams) -> StructuralContext:
+    """A structural context with a pinned key and nonce."""
+    return StructuralContext(STRUCTURAL_KEY, NONCE, params)
+
+
+def make_ctx(key: str = STRUCTURAL_KEY, nonce: str = NONCE,
+             params: StructuralParams = None) -> StructuralContext:
+    return StructuralContext(key, nonce, params or StructuralParams())
 
 
 @pytest.fixture
